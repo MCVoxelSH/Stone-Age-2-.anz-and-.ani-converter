@@ -470,7 +470,48 @@ def render_frame(
     return out
 
 
-def write_frames(anz: ANZFile, out_root: Path) -> list[tuple[int, int, Path, Image.Image]]:
+def align_object_frames(
+    frames: list[tuple[FrameRecord, Image.Image]],
+) -> list[tuple[FrameRecord, Image.Image]]:
+    """Place all frames of one object on a common coordinate-space canvas."""
+    if not frames:
+        return []
+    min_x = math.floor(min(frame.bbox[0] for frame, _image in frames))
+    min_y = math.floor(min(frame.bbox[1] for frame, _image in frames))
+    placements = [
+        (frame, image, round(frame.bbox[0]) - min_x, round(frame.bbox[1]) - min_y)
+        for frame, image in frames
+    ]
+    canvas_w = max(x + image.width for frame, image, x, y in placements)
+    canvas_h = max(y + image.height for frame, image, x, y in placements)
+    result: list[tuple[FrameRecord, Image.Image]] = []
+    for frame, image, x, y in placements:
+        aligned = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        aligned.alpha_composite(image, (x, y))
+        result.append((frame, aligned))
+    return result
+
+
+def render_object_frames(
+    anz: ANZFile,
+    obj: ANZObject,
+    tile_images: list[Image.Image],
+    align: bool,
+) -> list[tuple[FrameRecord, Image.Image]]:
+    rendered = [
+        (
+            frame,
+            render_frame(frame, tile_images, anz.tile_width, anz.tile_height),
+        )
+        for frame in obj.records
+        if frame.tile_refs != 0
+    ]
+    return align_object_frames(rendered) if align else rendered
+
+
+def write_frames(
+    anz: ANZFile, out_root: Path, align: bool = True
+) -> list[tuple[int, int, Path, Image.Image]]:
     frames_dir = out_root / "objects"
     frames_dir.mkdir(parents=True, exist_ok=True)
     palette_cache: dict[bytes, list[Image.Image]] = {}
@@ -487,12 +528,7 @@ def write_frames(anz: ANZFile, out_root: Path) -> list[tuple[int, int, Path, Ima
             palette_cache[obj.palette] = tile_images
         obj_dir = frames_dir / str(obj.object_id)
         obj_dir.mkdir(parents=True, exist_ok=True)
-        for frame in obj.records:
-            if frame.tile_refs == 0:
-                continue
-            image = render_frame(
-                frame, tile_images, anz.tile_width, anz.tile_height
-            )
+        for frame, image in render_object_frames(anz, obj, tile_images, align):
             path = obj_dir / f"frame_{frame.index:03d}.png"
             image.save(path)
             rendered.append((obj.object_id, frame.index, path, image))
@@ -562,6 +598,7 @@ def write_manifest(anz: ANZFile, out_root: Path) -> None:
                         "pixel_width": f.pixel_width,
                         "pixel_height": f.pixel_height,
                         "bbox": list(f.bbox),
+                        "origin_in_tight_frame": [-round(f.bbox[0]), -round(f.bbox[1])],
                         "subindex": f.subindex,
                     }
                     for f in obj.records
@@ -624,6 +661,14 @@ def main() -> int:
         action="store_true",
         help="manifest.json nicht schreiben",
     )
+    parser.add_argument(
+        "--tight-frames",
+        action="store_true",
+        help=(
+            "Frames einzeln eng zuschneiden. Standardmäßig werden alle Frames "
+            "eines Objekts anhand ihrer Bounding Box auf einer gemeinsamen Canvas ausgerichtet."
+        ),
+    )
     args = parser.parse_args()
 
     files = list(iter_graphic_files(args.input))
@@ -664,7 +709,7 @@ def main() -> int:
 
                 rendered: list[tuple[int, int, Path, Image.Image]] = []
                 if not args.no_frames:
-                    rendered = write_frames(anz, file_out)
+                    rendered = write_frames(anz, file_out, align=not args.tight_frames)
                     print(f"      PNG-Frames: {len(rendered)}")
                 elif args.atlas:
                     palette_cache: dict[bytes, list[Image.Image]] = {}
@@ -675,17 +720,15 @@ def main() -> int:
                                 anz.tiles, obj.palette, anz.tile_width, anz.tile_height, anz.bpp
                             )
                             palette_cache[obj.palette] = tile_images
-                        for frame in obj.records:
-                            if frame.tile_refs == 0:
-                                continue
+                        for frame, image in render_object_frames(
+                            anz, obj, tile_images, align=not args.tight_frames
+                        ):
                             rendered.append(
                                 (
                                     obj.object_id,
                                     frame.index,
                                     Path(),
-                                    render_frame(
-                                        frame, tile_images, anz.tile_width, anz.tile_height
-                                    ),
+                                    image,
                                 )
                             )
 
