@@ -536,7 +536,7 @@ def write_frames(
 
 
 def write_atlas(rendered: list[tuple[int, int, Path, Image.Image]], path: Path) -> None:
-    """Create a readable atlas without changing the sprite pixels.
+    """Create an unlabelled overview atlas without changing sprite pixels.
 
     Each cell is 128x128. Frames are centered and nearest-neighbour scaled down
     only when a frame exceeds the cell; no interpolation is used.
@@ -545,27 +545,149 @@ def write_atlas(rendered: list[tuple[int, int, Path, Image.Image]], path: Path) 
         return
     cell_w = 128
     cell_h = 128
+    frame_margin = 3
+    inner_w = cell_w - 2 * frame_margin
+    inner_h = cell_h - 2 * frame_margin
     columns = 12
     rows = math.ceil(len(rendered) / columns)
     atlas = Image.new("RGBA", (columns * cell_w, rows * cell_h), (70, 70, 70, 255))
     draw = ImageDraw.Draw(atlas)
 
     for i, (object_id, frame_index, _frame_path, image) in enumerate(rendered):
-        if image.width > cell_w or image.height > cell_h:
-            scale = min(cell_w / image.width, cell_h / image.height)
+        if image.width > inner_w or image.height > inner_h:
+            scale = min(inner_w / image.width, inner_h / image.height)
             image = image.resize(
                 (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
                 Image.Resampling.NEAREST,
             )
         x0 = (i % columns) * cell_w
         y0 = (i // columns) * cell_h
-        x = x0 + (cell_w - image.width) // 2
-        y = y0 + (cell_h - image.height) // 2
+        draw.rectangle(
+            (x0, y0, x0 + cell_w - 1, y0 + cell_h - 1),
+            outline=(105, 105, 105, 255),
+        )
+        # Keep the sprite strictly inside the border. Previously a 128-pixel
+        # sprite occupied the same outer pixel row as the 128-pixel cell frame.
+        x = x0 + frame_margin + (inner_w - image.width) // 2
+        y = y0 + frame_margin + (inner_h - image.height) // 2
         atlas.alpha_composite(image, (x, y))
-        draw.text((x0 + 2, y0 + 2), f"{object_id}:{frame_index}", fill=(255, 255, 255, 255))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     atlas.save(path)
+
+
+def write_object_sheet(
+    frames: list[tuple[int, Image.Image]],
+    out_dir: Path,
+    columns: int = 8,
+) -> tuple[Path, Path, Path]:
+    """Write engine-ready and presentation versions of one object's sheet."""
+    if not frames:
+        raise ANZError("Leeres Objekt kann nicht als Sprite Sheet geschrieben werden")
+
+    columns = max(1, min(columns, len(frames)))
+    rows = math.ceil(len(frames) / columns)
+    cell_w = max(image.width for _index, image in frames)
+    cell_h = max(image.height for _index, image in frames)
+
+    # Engine version: strictly regular transparent cells, no labels, borders or
+    # padding. It can be sliced directly with cell_w x cell_h in Godot.
+    sheet = Image.new("RGBA", (columns * cell_w, rows * cell_h), (0, 0, 0, 0))
+    frame_entries = []
+    for position, (frame_index, image) in enumerate(frames):
+        column = position % columns
+        row = position // columns
+        x = column * cell_w
+        y = row * cell_h
+        px = x + (cell_w - image.width) // 2
+        py = y + (cell_h - image.height) // 2
+        sheet.alpha_composite(image, (px, py))
+        frame_entries.append(
+            {
+                "frame_index": frame_index,
+                "column": column,
+                "row": row,
+                "x": x,
+                "y": y,
+                "width": cell_w,
+                "height": cell_h,
+            }
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sheet_path = out_dir / "sheet.png"
+    sheet.save(sheet_path)
+
+    # Presentation version: spacing and borders live outside the sprite cells,
+    # so neither the frame pixels nor their alignment are obscured.
+    padding = 4
+    border = 1
+    slot_w = cell_w + 2 * (padding + border)
+    slot_h = cell_h + 2 * (padding + border)
+    grid = Image.new(
+        "RGBA", (columns * slot_w, rows * slot_h), (58, 64, 70, 255)
+    )
+    grid_draw = ImageDraw.Draw(grid)
+    for position, (_frame_index, image) in enumerate(frames):
+        column = position % columns
+        row = position // columns
+        x0 = column * slot_w
+        y0 = row * slot_h
+        grid_draw.rectangle(
+            (x0, y0, x0 + slot_w - 1, y0 + slot_h - 1),
+            outline=(155, 165, 175, 255),
+        )
+        px = x0 + border + padding + (cell_w - image.width) // 2
+        py = y0 + border + padding + (cell_h - image.height) // 2
+        grid.alpha_composite(image, (px, py))
+
+    grid_path = out_dir / "sheet_grid.png"
+    grid.save(grid_path)
+
+    metadata = {
+        "frame_count": len(frames),
+        "columns": columns,
+        "rows": rows,
+        "cell_width": cell_w,
+        "cell_height": cell_h,
+        "sheet_width": sheet.width,
+        "sheet_height": sheet.height,
+        "background": "transparent",
+        "frames": frame_entries,
+    }
+    metadata_path = out_dir / "sheet.json"
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return sheet_path, grid_path, metadata_path
+
+
+def write_object_sheets(
+    anz: ANZFile,
+    out_root: Path,
+    align: bool = True,
+    columns: int = 8,
+) -> int:
+    objects_dir = out_root / "objects"
+    palette_cache: dict[bytes, list[Image.Image]] = {}
+    written = 0
+    for obj in anz.objects:
+        tile_images = palette_cache.get(obj.palette)
+        if tile_images is None:
+            tile_images = build_tile_images(
+                anz.tiles, obj.palette, anz.tile_width, anz.tile_height, anz.bpp
+            )
+            palette_cache[obj.palette] = tile_images
+        rendered = render_object_frames(anz, obj, tile_images, align)
+        if not rendered:
+            continue
+        write_object_sheet(
+            [(frame.index, image) for frame, image in rendered],
+            objects_dir / str(obj.object_id),
+            columns=columns,
+        )
+        written += 1
+    return written
 
 
 def write_manifest(anz: ANZFile, out_root: Path) -> None:
@@ -654,7 +776,18 @@ def main() -> int:
     parser.add_argument(
         "--no-frames",
         action="store_true",
-        help="Keine einzelnen Frames schreiben (nur zusammen mit --atlas sinnvoll)",
+        help="Keine einzelnen Frames schreiben (mit --atlas oder --sheets kombinierbar)",
+    )
+    parser.add_argument(
+        "--sheets",
+        action="store_true",
+        help="Pro Objekt ein sauberes sheet.png, sheet_grid.png und sheet.json erzeugen",
+    )
+    parser.add_argument(
+        "--sheet-columns",
+        type=int,
+        default=8,
+        help="Spaltenzahl der Objekt-Sprite-Sheets (Standard: 8)",
     )
     parser.add_argument(
         "--no-manifest",
@@ -670,6 +803,9 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+
+    if args.sheet_columns < 1:
+        parser.error("--sheet-columns muss mindestens 1 sein")
 
     files = list(iter_graphic_files(args.input))
     if not files:
@@ -736,6 +872,15 @@ def main() -> int:
                     atlas_path = file_out / "atlas.png"
                     write_atlas(rendered, atlas_path)
                     print(f"      Atlas: {atlas_path}")
+
+                if args.sheets:
+                    sheet_count = write_object_sheets(
+                        anz,
+                        file_out,
+                        align=not args.tight_frames,
+                        columns=args.sheet_columns,
+                    )
+                    print(f"      Objekt-Sheets: {sheet_count}")
 
                 if not args.no_manifest:
                     write_manifest(anz, file_out)
