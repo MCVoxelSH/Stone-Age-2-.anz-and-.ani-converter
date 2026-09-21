@@ -1,3 +1,7 @@
-Usage: ```python anz_to_png.py "path_to_StoneAge_2\graphic" -o "path_to_output_folder" --atlas```
+Usage: ```Usage:
+    python anz_to_png.py <input-folder>
+    python anz_to_png.py <input-folder> -o <output-folder>
+    python anz_to_png.py <file.anz>
+    python anz_to_png.py <input-folder> --no-frames --atlas```
 
 dependencies: Pillow - installation: ```pip install Pillow```
